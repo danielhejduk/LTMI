@@ -14,8 +14,9 @@ use smithay::{
         },
         winit::{self, WinitEvent},
     },
-    delegate_compositor, delegate_data_device, delegate_seat, delegate_shm, delegate_xdg_shell,
+    delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm, delegate_xdg_shell,
     input::{Seat, SeatHandler, SeatState, keyboard::FilterResult},
+    output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel},
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
@@ -28,9 +29,10 @@ use smithay::{
         },
         winit::platform::pump_events::PumpStatus,
     },
-    utils::{Logical, Rectangle, Serial, Size, Transform},
+    utils::{Logical, Physical, Rectangle, Serial, Size, Transform},
     wayland::{
         buffer::BufferHandler,
+        output::{OutputHandler, OutputManagerState},
         compositor::{
             CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction,
             with_surface_tree_downward,
@@ -130,6 +132,8 @@ impl ShmHandler for App {
     }
 }
 
+impl OutputHandler for App {}
+
 impl SeatHandler for App {
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;
@@ -151,8 +155,11 @@ struct App {
     shm_state: ShmState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
+    #[allow(dead_code)] // must be kept alive for the xdg-output global
+    output_manager_state: OutputManagerState,
 
     seat: Seat<Self>,
+    output: Output,
 
     output_size: Size<i32, Logical>,
 }
@@ -168,7 +175,11 @@ impl App {
         });
     }
 
-    fn resize_output(&mut self, size: Size<i32, Logical>) {
+    fn resize_output(&mut self, size: Size<i32, Physical>) {
+        let mode = OutputMode { size, refresh: 60_000 };
+        self.output.change_current_state(Some(mode), None, None, None);
+        self.output.set_preferred(mode);
+        let size = size.to_logical(1);
         self.output_size = size;
         for toplevel in self.xdg_shell_state.toplevel_surfaces() {
             self.set_fullscreen_state(toplevel);
@@ -198,6 +209,20 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     let mut seat_state = SeatState::new();
     let seat = seat_state.new_wl_seat(&dh, "winit");
 
+    // Chromium-based clients (Brave, Chrome, Electron) won't map a window until
+    // the compositor advertises at least one wl_output.
+    let output_manager_state = OutputManagerState::new_with_xdg_output::<App>(&dh);
+    let output = Output::new(
+        "winit".into(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "ltmi".into(),
+            model: "winit".into(),
+        },
+    );
+    output.create_global::<App>(&dh);
+
     let mut state = {
         App {
             compositor_state,
@@ -205,7 +230,9 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             shm_state,
             seat_state,
             data_device_state: DataDeviceState::new::<App>(&dh),
+            output_manager_state,
             seat,
+            output,
             output_size: Size::from((0, 0)),
         }
     };
@@ -215,24 +242,35 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
     let (mut backend, mut winit) = winit::init::<GlesRenderer>()?;
 
-    state.output_size = backend.window_size().to_logical(1);
+    state.resize_output(backend.window_size());
 
     let start_time = std::time::Instant::now();
 
     let keyboard = state.seat.add_keyboard(Default::default(), 200, 200).unwrap();
 
+    // Brave is single-instance per profile: if the host Brave is already running with the
+    // default profile, a new process just forwards its args over the SingletonSocket and exits,
+    // so the window opens on the host compositor. A dedicated profile dir forces a new instance.
+    let brave_profile = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".local/share")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ltmi/brave-profile");
+
     if let Err(err) = std::process::Command::new("brave")
+        .arg("--ozone-platform=wayland")
+        .arg(format!("--user-data-dir={}", brave_profile.display()))
         .env("WAYLAND_DISPLAY", SOCKET_NAME)
         .env_remove("DISPLAY") // Disable host XWayland
         .spawn()
     {
-        tracing::warn!("Failed to spawn weston-terminal: {err}");
+        tracing::warn!("Failed to spawn the app: {err}");
     }
 
     loop {
         let status = winit.dispatch_new_events(|event| match event {
             WinitEvent::Resized { size, .. } => {
-                state.resize_output(size.to_logical(1));
+                state.resize_output(size);
             }
             WinitEvent::Input(event) => match event {
                 InputEvent::Keyboard { event } => {
@@ -358,3 +396,4 @@ delegate_compositor!(App);
 delegate_shm!(App);
 delegate_seat!(App);
 delegate_data_device!(App);
+delegate_output!(App);
