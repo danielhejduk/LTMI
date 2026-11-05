@@ -28,7 +28,7 @@ use smithay::{
         },
         winit::platform::pump_events::PumpStatus,
     },
-    utils::{Rectangle, Serial, Transform},
+    utils::{Logical, Rectangle, Serial, Size, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -54,9 +54,21 @@ impl XdgShellHandler for App {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        surface.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Activated);
-        });
+        self.set_fullscreen_state(&surface);
+    }
+
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>) {
+        self.set_fullscreen_state(&surface);
+        surface.send_configure();
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        self.set_fullscreen_state(&surface);
+        surface.send_configure();
+    }
+
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        self.set_fullscreen_state(&surface);
         surface.send_configure();
     }
 
@@ -99,6 +111,16 @@ impl CompositorHandler for App {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+
+        if let Some(toplevel) = self
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find(|t| t.wl_surface() == surface)
+            && !toplevel.is_initial_configure_sent()
+        {
+            toplevel.send_configure();
+        }
     }
 }
 
@@ -131,6 +153,30 @@ struct App {
     data_device_state: DataDeviceState,
 
     seat: Seat<Self>,
+
+    output_size: Size<i32, Logical>,
+}
+
+impl App {
+    fn set_fullscreen_state(&self, surface: &ToplevelSurface) {
+        let size = self.output_size;
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Fullscreen);
+            state.states.set(xdg_toplevel::State::Activated);
+            state.states.unset(xdg_toplevel::State::Maximized);
+            state.size = Some(size);
+        });
+    }
+
+    fn resize_output(&mut self, size: Size<i32, Logical>) {
+        self.output_size = size;
+        for toplevel in self.xdg_shell_state.toplevel_surfaces() {
+            self.set_fullscreen_state(toplevel);
+            if toplevel.is_initial_configure_sent() {
+                toplevel.send_configure();
+            }
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -160,6 +206,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             seat_state,
             data_device_state: DataDeviceState::new::<App>(&dh),
             seat,
+            output_size: Size::from((0, 0)),
         }
     };
 
@@ -168,12 +215,15 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
     let (mut backend, mut winit) = winit::init::<GlesRenderer>()?;
 
+    state.output_size = backend.window_size().to_logical(1);
+
     let start_time = std::time::Instant::now();
 
     let keyboard = state.seat.add_keyboard(Default::default(), 200, 200).unwrap();
 
-    if let Err(err) = std::process::Command::new("weston-terminal")
+    if let Err(err) = std::process::Command::new("brave")
         .env("WAYLAND_DISPLAY", SOCKET_NAME)
+        .env_remove("DISPLAY") // Disable host XWayland
         .spawn()
     {
         tracing::warn!("Failed to spawn weston-terminal: {err}");
@@ -181,7 +231,9 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let status = winit.dispatch_new_events(|event| match event {
-            WinitEvent::Resized { .. } => {}
+            WinitEvent::Resized { size, .. } => {
+                state.resize_output(size.to_logical(1));
+            }
             WinitEvent::Input(event) => match event {
                 InputEvent::Keyboard { event } => {
                     keyboard.input::<(), _>(
