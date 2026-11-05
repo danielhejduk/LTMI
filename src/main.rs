@@ -1,5 +1,7 @@
 use std::{os::unix::io::OwnedFd, sync::Arc};
 
+use clap::Parser;
+
 use smithay::{
     backend::{
         input::{InputEvent, KeyboardKeyEvent},
@@ -190,17 +192,26 @@ impl App {
     }
 }
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Program path to a Chromium-based browser
+    app: String,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
     if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
         tracing_subscriber::fmt().with_env_filter(env_filter).init();
     } else {
         tracing_subscriber::fmt().init();
     }
 
-    run_winit()
+    run_winit(args.app)
 }
 
-pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
     let mut display: Display<App> = Display::new()?;
     let dh = display.handle();
 
@@ -257,7 +268,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(std::env::temp_dir)
         .join("ltmi/brave-profile");
 
-    if let Err(err) = std::process::Command::new("brave")
+    if let Err(err) = std::process::Command::new(app_name)
         .arg("--ozone-platform=wayland")
         .arg(format!("--user-data-dir={}", brave_profile.display()))
         .env("WAYLAND_DISPLAY", SOCKET_NAME)
