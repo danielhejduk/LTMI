@@ -4,7 +4,10 @@ use clap::Parser;
 
 use smithay::{
     backend::{
-        input::{InputEvent, KeyboardKeyEvent},
+        input::{
+            AbsolutePositionEvent, Axis, AxisSource, Event, InputEvent, KeyboardKeyEvent, PointerAxisEvent,
+            PointerButtonEvent,
+        },
         renderer::{
             Color32F, Frame, Renderer,
             element::{
@@ -17,7 +20,12 @@ use smithay::{
         winit::{self, WinitEvent},
     },
     delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm, delegate_xdg_shell,
-    input::{Seat, SeatHandler, SeatState, keyboard::FilterResult},
+    desktop::{PopupKind, PopupManager, WindowSurfaceType, utils::under_from_surface_tree},
+    input::{
+        Seat, SeatHandler, SeatState,
+        keyboard::FilterResult,
+        pointer::{AxisFrame, ButtonEvent, MotionEvent},
+    },
     output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel},
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
@@ -31,19 +39,21 @@ use smithay::{
         },
         winit::platform::pump_events::PumpStatus,
     },
-    utils::{Logical, Physical, Rectangle, Serial, Size, Transform},
+    utils::{Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform},
     wayland::{
         buffer::BufferHandler,
         output::{OutputHandler, OutputManagerState},
         compositor::{
             CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction,
-            with_surface_tree_downward,
+            with_states, with_surface_tree_downward,
         },
         selection::{
             SelectionHandler,
             data_device::{ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler},
         },
-        shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState},
+        shell::xdg::{
+            PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler, XdgShellState,
+        },
         shm::{ShmHandler, ShmState},
     },
 };
@@ -58,34 +68,41 @@ impl XdgShellHandler for App {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        self.set_fullscreen_state(&surface);
+        self.set_toplevel_state(&surface, false);
     }
 
-    fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>) {
-        self.set_fullscreen_state(&surface);
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>) {
+        self.set_toplevel_state(&surface, true);
         surface.send_configure();
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        self.set_fullscreen_state(&surface);
+        self.set_toplevel_state(&surface, false);
         surface.send_configure();
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        self.set_fullscreen_state(&surface);
+        // Windowed toplevels already fill the output; answer with the unchanged state as the protocol requires.
         surface.send_configure();
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
-        // Handle popup creation here
+    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        // The initial popup geometry is already taken from the positioner; the configure is sent on its first commit.
+        if let Err(err) = self.popups.track_popup(PopupKind::Xdg(surface)) {
+            tracing::warn!("Failed to track popup: {err:?}");
+        }
     }
 
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
         // Handle popup grab here
     }
 
-    fn reposition_request(&mut self, _surface: PopupSurface, _positioner: PositionerState, _token: u32) {
-        // Handle popup reposition here
+    fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        surface.send_repositioned(token);
     }
 }
 
@@ -115,6 +132,15 @@ impl CompositorHandler for App {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        self.popups.commit(surface);
+
+        // Like toplevels, popups may not attach a buffer until they received their first configure.
+        if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
+            && !popup.is_initial_configure_sent()
+            && let Err(err) = popup.send_configure()
+        {
+            tracing::warn!("Failed to configure popup: {err:?}");
+        }
 
         if let Some(toplevel) = self
             .xdg_shell_state
@@ -160,19 +186,56 @@ struct App {
     #[allow(dead_code)] // must be kept alive for the xdg-output global
     output_manager_state: OutputManagerState,
 
+    popups: PopupManager,
+
     seat: Seat<Self>,
     output: Output,
 
     output_size: Size<i32, Logical>,
 }
 
+/// The popups of `toplevel`, topmost first, each with the position of its surface origin in output coordinates.
+///
+/// Toplevel surfaces are always placed at the output origin.
+fn popups_of(toplevel: &WlSurface) -> impl Iterator<Item = (WlSurface, Point<i32, Logical>)> + use<> {
+    // Popups are positioned relative to the parent's window geometry, which may be inset
+    // from its surface origin (e.g. client-side shadows).
+    let geometry_loc = with_states(toplevel, |states| {
+        states
+            .cached_state
+            .get::<SurfaceCachedState>()
+            .current()
+            .geometry
+            .map(|geometry| geometry.loc)
+            .unwrap_or_default()
+    });
+    PopupManager::popups_for_surface(toplevel)
+        .map(move |(popup, loc)| (popup.wl_surface().clone(), geometry_loc + loc - popup.geometry().loc))
+}
+
 impl App {
-    fn set_fullscreen_state(&self, surface: &ToplevelSurface) {
+    /// Size `surface` to fill the output, either fullscreen or windowed.
+    ///
+    /// Windowed toplevels are tiled on every edge rather than maximized, so clients keep their title bar
+    /// (Chromium's tab strip) but drop client-side shadows and rounded corners that would not fit the output.
+    fn set_toplevel_state(&self, surface: &ToplevelSurface, fullscreen: bool) {
+        const TILED: [xdg_toplevel::State; 4] = [
+            xdg_toplevel::State::TiledLeft,
+            xdg_toplevel::State::TiledRight,
+            xdg_toplevel::State::TiledTop,
+            xdg_toplevel::State::TiledBottom,
+        ];
         let size = self.output_size;
         surface.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Fullscreen);
             state.states.set(xdg_toplevel::State::Activated);
             state.states.unset(xdg_toplevel::State::Maximized);
+            if fullscreen {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+                TILED.into_iter().for_each(|tiled| _ = state.states.unset(tiled));
+            } else {
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+                TILED.into_iter().for_each(|tiled| _ = state.states.set(tiled));
+            }
             state.size = Some(size);
         });
     }
@@ -184,11 +247,29 @@ impl App {
         let size = size.to_logical(1);
         self.output_size = size;
         for toplevel in self.xdg_shell_state.toplevel_surfaces() {
-            self.set_fullscreen_state(toplevel);
+            let fullscreen = toplevel.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Fullscreen));
+            self.set_toplevel_state(toplevel, fullscreen);
             if toplevel.is_initial_configure_sent() {
                 toplevel.send_configure();
             }
         }
+    }
+
+    /// The topmost surface under `location` with the position of its origin, searching popups first,
+    /// then each toplevel together with its subsurfaces (Chromium draws tooltips and bubbles as subsurfaces).
+    fn surface_under(&self, location: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find_map(|toplevel| {
+                let surface = toplevel.wl_surface();
+                popups_of(surface)
+                    .find_map(|(popup, loc)| {
+                        under_from_surface_tree(&popup, location, loc, WindowSurfaceType::ALL)
+                    })
+                    .or_else(|| under_from_surface_tree(surface, location, (0, 0), WindowSurfaceType::ALL))
+            })
+            .map(|(surface, loc)| (surface, loc.to_f64()))
     }
 }
 
@@ -242,6 +323,7 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
             seat_state,
             data_device_state: DataDeviceState::new::<App>(&dh),
             output_manager_state,
+            popups: PopupManager::default(),
             seat,
             output,
             output_size: Size::from((0, 0)),
@@ -258,6 +340,9 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = std::time::Instant::now();
 
     let keyboard = state.seat.add_keyboard(Default::default(), 200, 200).unwrap();
+    // Without a pointer the seat never advertises the wl_pointer capability, so clients
+    // never bind one and receive no mouse events at all.
+    let pointer = state.seat.add_pointer();
 
     // Brave is single-instance per profile: if the host Brave is already running with the
     // default profile, a new process just forwards its args over the SingletonSocket and exits,
@@ -269,8 +354,7 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
         .join("ltmi/brave-profile");
 
     if let Err(err) = std::process::Command::new(app_name)
-        .arg("--ozone-platform=wayland")
-        .arg(format!("--user-data-dir={}", brave_profile.display()))
+        .args(["--ozone-platform=wayland", format!("--user-data-dir={}", brave_profile.display()).as_str(), "--no-first-run"])
         .env("WAYLAND_DISPLAY", SOCKET_NAME)
         .env_remove("DISPLAY") // Disable host XWayland
         .spawn()
@@ -297,11 +381,62 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
                         },
                     );
                 }
-                InputEvent::PointerMotionAbsolute { .. } => {
-                    if let Some(surface) = state.xdg_shell_state.toplevel_surfaces().iter().next().cloned() {
-                        let surface = surface.wl_surface().clone();
+                InputEvent::PointerMotionAbsolute { event } => {
+                    let location = event.position_transformed(state.output_size);
+
+                    // Keyboard focus stays on the toplevel; Chromium routes keys to its menus and bubbles itself.
+                    if let Some(toplevel) = state.xdg_shell_state.toplevel_surfaces().first() {
+                        let surface = toplevel.wl_surface().clone();
                         keyboard.set_focus(&mut state, Some(surface), 0.into());
-                    };
+                    }
+
+                    let focus = state.surface_under(location);
+                    pointer.motion(
+                        &mut state,
+                        focus,
+                        &MotionEvent {
+                            location,
+                            serial: SERIAL_COUNTER.next_serial(),
+                            time: event.time_msec(),
+                        },
+                    );
+                    pointer.frame(&mut state);
+                }
+                InputEvent::PointerButton { event } => {
+                    pointer.button(
+                        &mut state,
+                        &ButtonEvent {
+                            serial: SERIAL_COUNTER.next_serial(),
+                            time: event.time_msec(),
+                            button: event.button_code(),
+                            state: event.state(),
+                        },
+                    );
+                    pointer.frame(&mut state);
+                }
+                InputEvent::PointerAxis { event } => {
+                    let source = event.source();
+                    let mut frame = AxisFrame::new(event.time_msec()).source(source);
+                    for axis in [Axis::Horizontal, Axis::Vertical] {
+                        // Wheel events only carry discrete v120 steps; derive a smooth value
+                        // from them (15px per notch, like libinput) for clients that want one.
+                        let v120 = event.amount_v120(axis);
+                        let amount = event
+                            .amount(axis)
+                            .unwrap_or_else(|| v120.unwrap_or(0.0) * 15.0 / 120.0);
+                        if amount != 0.0 {
+                            frame = frame
+                                .relative_direction(axis, event.relative_direction(axis))
+                                .value(axis, amount);
+                            if let Some(steps) = v120 {
+                                frame = frame.v120(axis, steps as i32);
+                            }
+                        } else if source == AxisSource::Finger {
+                            frame = frame.stop(axis);
+                        }
+                    }
+                    pointer.axis(&mut state, frame);
+                    pointer.frame(&mut state);
                 }
                 _ => {}
             },
@@ -317,21 +452,29 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
         let damage = Rectangle::from_size(size);
         {
             let (renderer, mut framebuffer) = backend.bind().unwrap();
-            let elements = state
-                .xdg_shell_state
-                .toplevel_surfaces()
-                .iter()
-                .flat_map(|surface| {
-                    render_elements_from_surface_tree(
+            // Elements are ordered front to back, so each toplevel's popups go before the toplevel itself.
+            let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+            for toplevel in state.xdg_shell_state.toplevel_surfaces() {
+                let surface = toplevel.wl_surface();
+                for (popup, loc) in popups_of(surface) {
+                    elements.extend(render_elements_from_surface_tree(
                         renderer,
-                        surface.wl_surface(),
-                        (0, 0),
+                        &popup,
+                        loc.to_physical(1),
                         1.0,
                         1.0,
                         Kind::Unspecified,
-                    )
-                })
-                .collect::<Vec<WaylandSurfaceRenderElement<GlesRenderer>>>();
+                    ));
+                }
+                elements.extend(render_elements_from_surface_tree(
+                    renderer,
+                    surface,
+                    (0, 0),
+                    1.0,
+                    1.0,
+                    Kind::Unspecified,
+                ));
+            }
 
             let mut frame = renderer
                 .render(&mut framebuffer, size, Transform::Flipped180)
@@ -341,8 +484,12 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
             // We rely on the nested compositor to do the sync for us
             let _ = frame.finish().unwrap();
 
-            for surface in state.xdg_shell_state.toplevel_surfaces() {
-                send_frames_surface_tree(surface.wl_surface(), start_time.elapsed().as_millis() as u32);
+            let time = start_time.elapsed().as_millis() as u32;
+            for toplevel in state.xdg_shell_state.toplevel_surfaces() {
+                for (popup, _) in popups_of(toplevel.wl_surface()) {
+                    send_frames_surface_tree(&popup, time);
+                }
+                send_frames_surface_tree(toplevel.wl_surface(), time);
             }
 
             if let Some(stream) = listener.accept()? {
@@ -356,6 +503,7 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             display.dispatch_clients(&mut state)?;
+            state.popups.cleanup();
             display.flush_clients()?;
         }
 
