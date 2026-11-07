@@ -15,7 +15,7 @@ pub fn launch(app: &str, socket_name: &str) -> Result<Child, Box<dyn Error>> {
     Ok(
         Command::new(app)
             .args(["--ozone-platform=wayland", format!("--user-data-dir={}", brave_profile.display()).as_str(), "--no-first-run"])
-            .env("WAYLAND_DISPLAY", "wayland-5")
+            .env("WAYLAND_DISPLAY", socket_name)
             .env_remove("DISPLAY")
             .spawn()?
     )
