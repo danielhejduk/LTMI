@@ -42,11 +42,11 @@ use smithay::{
     utils::{Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform},
     wayland::{
         buffer::BufferHandler,
-        output::{OutputHandler, OutputManagerState},
         compositor::{
-            CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction,
-            with_states, with_surface_tree_downward,
+            CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction, with_states,
+            with_surface_tree_downward,
         },
+        output::{OutputHandler, OutputManagerState},
         selection::{
             SelectionHandler,
             data_device::{ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler},
@@ -73,7 +73,11 @@ impl XdgShellHandler for App {
         self.set_toplevel_state(&surface, false);
     }
 
-    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>) {
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+    ) {
         self.set_toplevel_state(&surface, true);
         surface.send_configure();
     }
@@ -247,7 +251,8 @@ impl App {
         let size = size.to_logical(1);
         self.output_size = size;
         for toplevel in self.xdg_shell_state.toplevel_surfaces() {
-            let fullscreen = toplevel.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Fullscreen));
+            let fullscreen =
+                toplevel.with_pending_state(|state| state.states.contains(xdg_toplevel::State::Fullscreen));
             self.set_toplevel_state(toplevel, fullscreen);
             if toplevel.is_initial_configure_sent() {
                 toplevel.send_configure();
@@ -264,9 +269,7 @@ impl App {
             .find_map(|toplevel| {
                 let surface = toplevel.wl_surface();
                 popups_of(surface)
-                    .find_map(|(popup, loc)| {
-                        under_from_surface_tree(&popup, location, loc, WindowSurfaceType::ALL)
-                    })
+                    .find_map(|(popup, loc)| under_from_surface_tree(&popup, location, loc, WindowSurfaceType::ALL))
                     .or_else(|| under_from_surface_tree(surface, location, (0, 0), WindowSurfaceType::ALL))
             })
             .map(|(surface, loc)| (surface, loc.to_f64()))
@@ -344,26 +347,12 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
     // never bind one and receive no mouse events at all.
     let pointer = state.seat.add_pointer();
 
-    // Brave is single-instance per profile: if the host Brave is already running with the
-    // default profile, a new process just forwards its args over the SingletonSocket and exits,
-    // so the window opens on the host compositor. A dedicated profile dir forces a new instance.
-    let brave_profile = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".local/share")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("ltmi/brave-profile");
-
-    /*
-    let mut app = std::process::Command::new(&app_name)
-        .args(["--ozone-platform=wayland", format!("--user-data-dir={}", brave_profile.display()).as_str(), "--no-first-run"])
-        .env("WAYLAND_DISPLAY", SOCKET_NAME)
-        .env_remove("DISPLAY") // Disable host XWayland
-        .spawn()
-        .map_err(|err| format!("Failed to spawn {app_name}: {err}"))?;
-    */
-
     let socket_name = listener.socket_name().unwrap().to_owned();
-    let mut app = launch::launch(&app_name, &socket_name.to_str().unwrap())?;
+    let mut app = launch::launch(
+        &app_name,
+        &launch::get_args(launch::Args::Chromium),
+        socket_name.to_str().unwrap(),
+    )?;
 
     loop {
         // The compositor only exists to host the app, so quit once it exits (this also reaps it).
@@ -430,9 +419,7 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
                         // Wheel events only carry discrete v120 steps; derive a smooth value
                         // from them (15px per notch, like libinput) for clients that want one.
                         let v120 = event.amount_v120(axis);
-                        let amount = event
-                            .amount(axis)
-                            .unwrap_or_else(|| v120.unwrap_or(0.0) * 15.0 / 120.0);
+                        let amount = event.amount(axis).unwrap_or_else(|| v120.unwrap_or(0.0) * 15.0 / 120.0);
                         if amount != 0.0 {
                             frame = frame
                                 .relative_direction(axis, event.relative_direction(axis))
@@ -485,9 +472,7 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
 
-            let mut frame = renderer
-                .render(&mut framebuffer, size, Transform::Flipped180)
-                .unwrap();
+            let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180).unwrap();
             frame.clear(Color32F::new(0.1, 0.0, 0.0, 1.0), &[damage]).unwrap();
             draw_render_elements(&mut frame, 1.0, &elements, &[damage]).unwrap();
             // We rely on the nested compositor to do the sync for us
