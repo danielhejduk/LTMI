@@ -58,6 +58,8 @@ use smithay::{
     },
 };
 
+mod launch;
+
 impl BufferHandler for App {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
 }
@@ -174,8 +176,6 @@ impl SeatHandler for App {
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: smithay::input::pointer::CursorImageStatus) {}
 }
-
-const SOCKET_NAME: &str = "wayland-5";
 
 struct App {
     compositor_state: CompositorState,
@@ -330,7 +330,7 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let listener = ListeningSocket::bind(SOCKET_NAME)?;
+    let listener = ListeningSocket::bind_auto("wayland", 1..33)?;
     let mut clients = Vec::new();
 
     let (mut backend, mut winit) = winit::init::<GlesRenderer>()?;
@@ -353,16 +353,25 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(std::env::temp_dir)
         .join("ltmi/brave-profile");
 
-    if let Err(err) = std::process::Command::new(app_name)
+    /*
+    let mut app = std::process::Command::new(&app_name)
         .args(["--ozone-platform=wayland", format!("--user-data-dir={}", brave_profile.display()).as_str(), "--no-first-run"])
         .env("WAYLAND_DISPLAY", SOCKET_NAME)
         .env_remove("DISPLAY") // Disable host XWayland
         .spawn()
-    {
-        tracing::warn!("Failed to spawn the app: {err}");
-    }
+        .map_err(|err| format!("Failed to spawn {app_name}: {err}"))?;
+    */
+
+    let socket_name = listener.socket_name().unwrap().to_owned();
+    let mut app = launch::launch(&app_name, &socket_name.to_str().unwrap())?;
 
     loop {
+        // The compositor only exists to host the app, so quit once it exits (this also reaps it).
+        if let Some(status) = app.try_wait()? {
+            tracing::info!("{app_name} exited with {status}, quitting");
+            return Ok(());
+        }
+
         let status = winit.dispatch_new_events(|event| match event {
             WinitEvent::Resized { size, .. } => {
                 state.resize_output(size);
