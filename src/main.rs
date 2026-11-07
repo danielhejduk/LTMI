@@ -24,6 +24,7 @@ use smithay::{
         winit::{self, WinitEvent},
     },
     delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm, delegate_xdg_shell,
+    delegate_xwayland_shell,
     desktop::{PopupKind, PopupManager, WindowSurfaceType, utils::under_from_surface_tree},
     input::{
         Seat, SeatHandler, SeatState,
@@ -32,6 +33,7 @@ use smithay::{
     },
     output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel},
     reexports::{
+        calloop::EventLoop,
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
             Client, Display, ListeningSocket,
@@ -59,13 +61,16 @@ use smithay::{
             PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler, XdgShellState,
         },
         shm::{ShmHandler, ShmState},
+        xwayland_shell::XWaylandShellState,
     },
+    xwayland::{X11Surface, X11Wm, XWaylandClientData},
 };
 
-use crate::timer::Timer;
+use crate::{timer::Timer, xwayland::FocusTarget};
 
 mod launch;
 mod timer;
+mod xwayland;
 
 impl BufferHandler for App {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
@@ -140,6 +145,9 @@ impl CompositorHandler for App {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        if let Some(xwayland) = client.get_data::<XWaylandClientData>() {
+            return &xwayland.compositor_state;
+        }
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 
@@ -176,7 +184,7 @@ impl ShmHandler for App {
 impl OutputHandler for App {}
 
 impl SeatHandler for App {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = FocusTarget;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
@@ -184,7 +192,7 @@ impl SeatHandler for App {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&FocusTarget>) {}
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: smithay::input::pointer::CursorImageStatus) {}
 }
 
@@ -196,8 +204,13 @@ struct App {
     data_device_state: DataDeviceState,
     #[allow(dead_code)] // must be kept alive for the xdg-output global
     output_manager_state: OutputManagerState,
+    xwayland_shell_state: XWaylandShellState,
+    /// Set once Xwayland is ready.
+    xwm: Option<X11Wm>,
 
     popups: PopupManager,
+    /// Mapped X11 windows, managed and override-redirect, oldest first.
+    x11_windows: Vec<X11Surface>,
 
     seat: Seat<Self>,
     output: Output,
@@ -265,19 +278,49 @@ impl App {
                 toplevel.send_configure();
             }
         }
+        for window in self.x11_windows.iter().filter(|w| !w.is_override_redirect()) {
+            self.configure_x11(window);
+        }
     }
 
-    /// The topmost surface under `location` with the position of its origin, searching popups first,
-    /// then each toplevel together with its subsurfaces (Chromium draws tooltips and bubbles as subsurfaces).
-    fn surface_under(&self, location: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.xdg_shell_state
-            .toplevel_surfaces()
+    /// Give keyboard focus to the newest managed X11 window, otherwise to the first Wayland toplevel.
+    ///
+    /// X11 windows without a `wl_surface` yet are skipped: focusing them would set X input focus but never
+    /// send Xwayland the matching `wl_keyboard.enter`.
+    fn refocus(&mut self) {
+        let focus = self
+            .x11_windows
             .iter()
-            .find_map(|toplevel| {
-                let surface = toplevel.wl_surface();
-                popups_of(surface)
-                    .find_map(|(popup, loc)| under_from_surface_tree(&popup, location, loc, WindowSurfaceType::ALL))
-                    .or_else(|| under_from_surface_tree(surface, location, (0, 0), WindowSurfaceType::ALL))
+            .rev()
+            .find(|w| !w.is_override_redirect() && w.wl_surface().is_some())
+            .map(|w| FocusTarget::X11(w.clone()))
+            .or_else(|| {
+                let toplevel = self.xdg_shell_state.toplevel_surfaces().first()?;
+                Some(FocusTarget::Wayland(toplevel.wl_surface().clone()))
+            });
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(self, focus, SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    /// The topmost surface under `location` with the position of its origin, searching X11 windows first
+    /// (newest on top), then the popups and each toplevel together with its subsurfaces (Chromium draws
+    /// tooltips and bubbles as subsurfaces).
+    fn surface_under(&self, location: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.x11_windows
+            .iter()
+            .rev()
+            .find_map(|window| {
+                let surface = window.wl_surface()?;
+                under_from_surface_tree(&surface, location, window.geometry().loc, WindowSurfaceType::ALL)
+            })
+            .or_else(|| {
+                self.xdg_shell_state.toplevel_surfaces().iter().find_map(|toplevel| {
+                    let surface = toplevel.wl_surface();
+                    popups_of(surface)
+                        .find_map(|(popup, loc)| under_from_surface_tree(&popup, location, loc, WindowSurfaceType::ALL))
+                        .or_else(|| under_from_surface_tree(surface, location, (0, 0), WindowSurfaceType::ALL))
+                })
             })
             .map(|(surface, loc)| (surface, loc.to_f64()))
     }
@@ -291,6 +334,10 @@ struct Args {
 
     #[arg(short, long, default_value = "30m", value_parser = humantime::parse_duration)]
     time: Duration,
+
+    /// Argument preset to launch the program with
+    #[arg(short, long, value_enum, default_value_t)]
+    preset: launch::Preset,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -302,10 +349,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing_subscriber::fmt().init();
     }
 
-    run_winit(args.app, args.time)
+    run_winit(args.app, args.time, args.preset)
 }
 
-pub fn run_winit(app_name: String, duration: Duration) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_winit(
+    app_name: String,
+    duration: Duration,
+    preset: launch::Preset,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut display: Display<App> = Display::new()?;
     let dh = display.handle();
 
@@ -328,6 +379,9 @@ pub fn run_winit(app_name: String, duration: Duration) -> Result<(), Box<dyn std
     );
     output.create_global::<App>(&dh);
 
+    // Xwayland and its window manager are calloop event sources; the loop is dispatched once per frame.
+    let mut event_loop: EventLoop<'static, App> = EventLoop::try_new()?;
+
     let mut state = {
         App {
             compositor_state,
@@ -336,7 +390,11 @@ pub fn run_winit(app_name: String, duration: Duration) -> Result<(), Box<dyn std
             seat_state,
             data_device_state: DataDeviceState::new::<App>(&dh),
             output_manager_state,
+            // Created before Xwayland starts, since Xwayland binds it to pair its surfaces with X windows.
+            xwayland_shell_state: XWaylandShellState::new::<App>(&dh),
+            xwm: None,
             popups: PopupManager::default(),
+            x11_windows: Vec::new(),
             seat,
             output,
             output_size: Size::from((0, 0)),
@@ -357,15 +415,17 @@ pub fn run_winit(app_name: String, duration: Duration) -> Result<(), Box<dyn std
     // never bind one and receive no mouse events at all.
     let pointer = state.seat.add_pointer();
 
+    // Kept alive until ltmi exits, when dropping it cleans up the X display.
+    let xserver = xwayland::start(&dh, &event_loop.handle());
+    let x_display = xserver.as_ref().map(|x| x.display);
+
     let socket_name = listener.socket_name().unwrap().to_owned();
     let socket_name = socket_name.to_str().unwrap();
-    let launch_args = launch::get_args(launch::Args::Chromium);
-    let mut app = launch::launch(&app_name, &launch_args, socket_name)?;
+    let launch_args = launch::get_args(preset);
+    let mut app = launch::launch(&app_name, &launch_args, socket_name, x_display)?;
     let mut launched_at = Instant::now();
 
-    // A relaunch brings back the tabs the user just closed.
-    let mut relaunch_args = launch_args.clone();
-    relaunch_args.push("--restore-last-session".to_string());
+    let relaunch_args = launch::get_relaunch_args(preset);
     // Keeps an app that dies right after starting from being respawned every frame.
     const MIN_RELAUNCH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -394,7 +454,7 @@ pub fn run_winit(app_name: String, duration: Duration) -> Result<(), Box<dyn std
                     "{app_name} exited with {status} while locked ({} left), relaunching",
                     humantime::format_duration(left)
                 );
-                app = launch::launch(&app_name, &relaunch_args, socket_name)?;
+                app = launch::launch(&app_name, &relaunch_args, socket_name, x_display)?;
                 launched_at = now;
             }
         }
@@ -425,11 +485,8 @@ pub fn run_winit(app_name: String, duration: Duration) -> Result<(), Box<dyn std
                 InputEvent::PointerMotionAbsolute { event } => {
                     let location = event.position_transformed(state.output_size);
 
-                    // Keyboard focus stays on the toplevel; Chromium routes keys to its menus and bubbles itself.
-                    if let Some(toplevel) = state.xdg_shell_state.toplevel_surfaces().first() {
-                        let surface = toplevel.wl_surface().clone();
-                        keyboard.set_focus(&mut state, Some(surface), 0.into());
-                    }
+                    // Keyboard focus stays on the app's window; Chromium routes keys to its menus and bubbles itself.
+                    state.refocus();
 
                     let focus = state.surface_under(location);
                     pointer.motion(
@@ -485,6 +542,9 @@ pub fn run_winit(app_name: String, duration: Duration) -> Result<(), Box<dyn std
                     for toplevel in state.xdg_shell_state.toplevel_surfaces() {
                         toplevel.send_close();
                     }
+                    for window in state.x11_windows.iter().filter(|w| !w.is_override_redirect()) {
+                        let _ = window.close();
+                    }
                     kill_at.get_or_insert(now + Duration::from_secs(5));
                 } else {
                     let left = Duration::from_secs(timer.remaining(now).as_secs());
@@ -503,8 +563,21 @@ pub fn run_winit(app_name: String, duration: Duration) -> Result<(), Box<dyn std
         let damage = Rectangle::from_size(size);
         {
             let (renderer, mut framebuffer) = backend.bind().unwrap();
-            // Elements are ordered front to back, so each toplevel's popups go before the toplevel itself.
+            // Elements are ordered front to back: X11 windows (newest first) above the Wayland toplevels,
+            // and each toplevel's popups before the toplevel itself.
             let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+            for window in state.x11_windows.iter().rev() {
+                if let Some(surface) = window.wl_surface() {
+                    elements.extend(render_elements_from_surface_tree(
+                        renderer,
+                        &surface,
+                        window.geometry().loc.to_physical(1),
+                        1.0,
+                        1.0,
+                        Kind::Unspecified,
+                    ));
+                }
+            }
             for toplevel in state.xdg_shell_state.toplevel_surfaces() {
                 let surface = toplevel.wl_surface();
                 for (popup, loc) in popups_of(surface) {
@@ -540,6 +613,9 @@ pub fn run_winit(app_name: String, duration: Duration) -> Result<(), Box<dyn std
                 }
                 send_frames_surface_tree(toplevel.wl_surface(), time);
             }
+            for surface in state.x11_windows.iter().filter_map(X11Surface::wl_surface) {
+                send_frames_surface_tree(&surface, time);
+            }
 
             if let Some(stream) = listener.accept()? {
                 tracing::info!("Got a client: {:?}", stream);
@@ -551,6 +627,7 @@ pub fn run_winit(app_name: String, duration: Duration) -> Result<(), Box<dyn std
                 clients.push(client);
             }
 
+            event_loop.dispatch(Some(Duration::ZERO), &mut state)?;
             display.dispatch_clients(&mut state)?;
             state.popups.cleanup();
             display.flush_clients()?;
@@ -605,3 +682,4 @@ delegate_shm!(App);
 delegate_seat!(App);
 delegate_data_device!(App);
 delegate_output!(App);
+delegate_xwayland_shell!(App);
