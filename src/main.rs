@@ -1,4 +1,8 @@
-use std::{os::unix::io::OwnedFd, sync::Arc};
+use std::{
+    os::unix::io::OwnedFd,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use clap::Parser;
 
@@ -58,7 +62,10 @@ use smithay::{
     },
 };
 
+use crate::timer::Timer;
+
 mod launch;
+mod timer;
 
 impl BufferHandler for App {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
@@ -279,8 +286,11 @@ impl App {
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Program path to a Chromium-based browser
+    /// Path to a program
     app: String,
+
+    #[arg(short, long, default_value = "30m", value_parser = humantime::parse_duration)]
+    time: Duration,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -292,10 +302,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing_subscriber::fmt().init();
     }
 
-    run_winit(args.app)
+    run_winit(args.app, args.time)
 }
 
-pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_winit(app_name: String, duration: Duration) -> Result<(), Box<dyn std::error::Error>> {
     let mut display: Display<App> = Display::new()?;
     let dh = display.handle();
 
@@ -348,17 +358,50 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
     let pointer = state.seat.add_pointer();
 
     let socket_name = listener.socket_name().unwrap().to_owned();
-    let mut app = launch::launch(
-        &app_name,
-        &launch::get_args(launch::Args::Chromium),
-        socket_name.to_str().unwrap(),
-    )?;
+    let socket_name = socket_name.to_str().unwrap();
+    let launch_args = launch::get_args(launch::Args::Chromium);
+    let mut app = launch::launch(&app_name, &launch_args, socket_name)?;
+    let mut launched_at = Instant::now();
+
+    // A relaunch brings back the tabs the user just closed.
+    let mut relaunch_args = launch_args.clone();
+    relaunch_args.push("--restore-last-session".to_string());
+    // Keeps an app that dies right after starting from being respawned every frame.
+    const MIN_RELAUNCH_INTERVAL: Duration = Duration::from_secs(1);
+
+    let timer = Timer::new(Instant::now(), duration);
+    let mut unlocked = false;
+    let mut kill_at: Option<Instant> = None;
 
     loop {
+        let now = Instant::now();
+        if !unlocked && timer.is_done(now) {
+            unlocked = true;
+            tracing::info!("timer done, unlocked");
+        }
+
         // The compositor only exists to host the app, so quit once it exits (this also reaps it).
+        // While locked, the app closing itself (its own close button, Ctrl+Q, closing the last tab)
+        // must not end the session, so it is started again instead.
         if let Some(status) = app.try_wait()? {
-            tracing::info!("{app_name} exited with {status}, quitting");
-            return Ok(());
+            if unlocked {
+                tracing::info!("{app_name} exited with {status}, quitting");
+                return Ok(());
+            }
+            if now.duration_since(launched_at) >= MIN_RELAUNCH_INTERVAL {
+                let left = Duration::from_secs(timer.remaining(now).as_secs());
+                tracing::info!(
+                    "{app_name} exited with {status} while locked ({} left), relaunching",
+                    humantime::format_duration(left)
+                );
+                app = launch::launch(&app_name, &relaunch_args, socket_name)?;
+                launched_at = now;
+            }
+        }
+
+        if kill_at.is_some_and(|t| now >= t) {
+            app.kill()?;
+            kill_at = None;
         }
 
         let status = winit.dispatch_new_events(|event| match event {
@@ -436,6 +479,18 @@ pub fn run_winit(app_name: String) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => {}
             },
+            WinitEvent::CloseRequested => {
+                let now = Instant::now();
+                if timer.is_done(now) {
+                    for toplevel in state.xdg_shell_state.toplevel_surfaces() {
+                        toplevel.send_close();
+                    }
+                    kill_at.get_or_insert(now + Duration::from_secs(5));
+                } else {
+                    let left = Duration::from_secs(timer.remaining(now).as_secs());
+                    tracing::info!("close ignored: locked {} left", humantime::format_duration(left));
+                }
+            }
             _ => (),
         });
 
