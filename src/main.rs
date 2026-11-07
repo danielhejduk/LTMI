@@ -8,6 +8,7 @@ use clap::Parser;
 
 use smithay::{
     backend::{
+        allocator::dmabuf::Dmabuf,
         input::{
             AbsolutePositionEvent, Axis, AxisSource, Event, InputEvent, KeyboardKeyEvent, PointerAxisEvent,
             PointerButtonEvent,
@@ -23,8 +24,8 @@ use smithay::{
         },
         winit::{self, WinitEvent},
     },
-    delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm, delegate_xdg_shell,
-    delegate_xwayland_shell,
+    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_output, delegate_seat, delegate_shm,
+    delegate_xdg_shell, delegate_xwayland_shell,
     desktop::{PopupKind, PopupManager, WindowSurfaceType, utils::under_from_surface_tree},
     input::{
         Seat, SeatHandler, SeatState,
@@ -52,6 +53,7 @@ use smithay::{
             CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction, with_states,
             with_surface_tree_downward,
         },
+        dmabuf::{DmabufState, ImportNotifier},
         output::{OutputHandler, OutputManagerState},
         selection::{
             SelectionHandler,
@@ -68,6 +70,7 @@ use smithay::{
 
 use crate::{timer::Timer, xwayland::FocusTarget};
 
+mod dmabuf;
 mod launch;
 mod timer;
 mod xwayland;
@@ -205,6 +208,9 @@ struct App {
     #[allow(dead_code)] // must be kept alive for the xdg-output global
     output_manager_state: OutputManagerState,
     xwayland_shell_state: XWaylandShellState,
+    dmabuf_state: DmabufState,
+    /// Client dmabufs waiting for a test import, see [`dmabuf::import_pending`].
+    pending_dmabufs: Vec<(Dmabuf, ImportNotifier)>,
     /// Set once Xwayland is ready.
     xwm: Option<X11Wm>,
 
@@ -392,6 +398,8 @@ pub fn run_winit(
             output_manager_state,
             // Created before Xwayland starts, since Xwayland binds it to pair its surfaces with X windows.
             xwayland_shell_state: XWaylandShellState::new::<App>(&dh),
+            dmabuf_state: DmabufState::new(),
+            pending_dmabufs: Vec::new(),
             xwm: None,
             popups: PopupManager::default(),
             x11_windows: Vec::new(),
@@ -405,6 +413,8 @@ pub fn run_winit(
     let mut clients = Vec::new();
 
     let (mut backend, mut winit) = winit::init::<GlesRenderer>()?;
+    // Before Xwayland and the app start, which only look for it when they connect.
+    dmabuf::init(&mut state.dmabuf_state, &dh, backend.renderer());
 
     state.resize_output(backend.window_size());
 
@@ -559,6 +569,9 @@ pub fn run_winit(
             PumpStatus::Exit(_) => return Ok(()),
         };
 
+        // Before binding: importing leaves the EGL context without ltmi's window surface, which bind() restores.
+        dmabuf::import_pending(&mut state, backend.renderer());
+
         let size = backend.window_size();
         let damage = Rectangle::from_size(size);
         {
@@ -683,3 +696,4 @@ delegate_seat!(App);
 delegate_data_device!(App);
 delegate_output!(App);
 delegate_xwayland_shell!(App);
+delegate_dmabuf!(App);

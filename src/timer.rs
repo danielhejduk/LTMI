@@ -2,14 +2,12 @@ use std::time::{Duration, Instant};
 
 pub struct Timer {
     start: Instant,
-    duration: Duration
+    duration: Duration,
 }
 
 impl Timer {
     pub fn new(start: Instant, duration: Duration) -> Self {
-        Self {
-            start, duration
-        }
+        Self { start, duration }
     }
 
     pub fn remaining(&self, now: Instant) -> Duration {
