@@ -24,16 +24,16 @@ pub fn launch(app: &str, args: &[String], socket_name: &str, x_display: Option<u
 }
 
 pub fn get_args(preset: Preset) -> Vec<String> {
-    let brave_profile = std::env::var_os("XDG_DATA_HOME")
+    let chromium_profile = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".local/share")))
         .unwrap_or_else(std::env::temp_dir)
-        .join("ltmi/brave-profile");
+        .join("ltmi/chromium-profile");
 
     match preset {
         Preset::Chromium => vec![
             "--ozone-platform=wayland".to_string(),
-            format!("--user-data-dir={}", brave_profile.display()),
+            format!("--user-data-dir={}", chromium_profile.display()),
             "--no-first-run".to_string(),
         ],
         Preset::Blank => vec![],
