@@ -225,10 +225,33 @@ struct App {
     output_size: Size<i32, Logical>,
 }
 
+const TIMER_BAR_HEIGHT: i32 = 6;
+const TIMER_BAR_TRACK: Color32F = Color32F::new(0.15, 0.15, 0.15, 1.0);
+const TIMER_BAR_FILL: Color32F = Color32F::new(0.25, 0.55, 0.95, 1.0);
+const TIMER_BAR_DONE: Color32F = Color32F::new(0.3, 0.8, 0.4, 1.0);
+
+fn draw_timer_bar(frame: &mut impl Frame, size: Size<i32, Physical>, progress: f64) -> Result<(), Box<dyn std::error::Error>> {
+    let bar = Rectangle::from_size((size.w, TIMER_BAR_HEIGHT.min(size.h)).into());
+    let filled = Rectangle::from_size(((f64::from(size.w) * progress).round() as i32, bar.size.h).into());
+    let fill = if progress >= 1.0 { TIMER_BAR_DONE } else { TIMER_BAR_FILL };
+
+    for (dst, color) in [(bar, TIMER_BAR_TRACK), (filled, fill)] {
+        if !dst.is_empty() {
+            frame
+                .draw_solid(dst, &[Rectangle::from_size(dst.size)], color)
+                .map_err(|err| format!("failed to draw the timer bar: {err:?}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// The popups of `toplevel`, topmost first, each with the position of its surface origin in output coordinates.
 ///
 /// Toplevel surfaces are always placed at the output origin.
-fn popups_of(toplevel: &WlSurface) -> impl Iterator<Item = (WlSurface, Point<i32, Logical>)> + use<> {
+fn popups_of(
+    toplevel: &WlSurface,
+    origin: Point<i32, Logical>,
+) -> impl Iterator<Item = (WlSurface, Point<i32, Logical>)> + use<> {
     // Popups are positioned relative to the parent's window geometry, which may be inset
     // from its surface origin (e.g. client-side shadows).
     let geometry_loc = with_states(toplevel, |states| {
@@ -241,11 +264,15 @@ fn popups_of(toplevel: &WlSurface) -> impl Iterator<Item = (WlSurface, Point<i32
             .unwrap_or_default()
     });
     PopupManager::popups_for_surface(toplevel)
-        .map(move |(popup, loc)| (popup.wl_surface().clone(), geometry_loc + loc - popup.geometry().loc))
+        .map(move |(popup, loc)| (popup.wl_surface().clone(), origin + geometry_loc + loc - popup.geometry().loc))
 }
 
 impl App {
-    /// Size `surface` to fill the output, either fullscreen or windowed.
+    pub fn content_area(&self) -> Rectangle<i32, Logical> {
+        let bar = TIMER_BAR_HEIGHT.min(self.output_size.h).max(0);
+        Rectangle::new((0, bar).into(), (self.output_size.w, self.output_size.h - bar).into())
+    }
+    /// Size `surface` to fill the content area, either fullscreen or windowed.
     ///
     /// Windowed toplevels are tiled on every edge rather than maximized, so clients keep their title bar
     /// (Chromium's tab strip) but drop client-side shadows and rounded corners that would not fit the output.
@@ -256,7 +283,7 @@ impl App {
             xdg_toplevel::State::TiledTop,
             xdg_toplevel::State::TiledBottom,
         ];
-        let size = self.output_size;
+        let size = self.content_area().size;
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
             state.states.unset(xdg_toplevel::State::Maximized);
@@ -322,11 +349,12 @@ impl App {
                 under_from_surface_tree(&surface, location, window.geometry().loc, WindowSurfaceType::ALL)
             })
             .or_else(|| {
+                let origin = self.content_area().loc;
                 self.xdg_shell_state.toplevel_surfaces().iter().find_map(|toplevel| {
                     let surface = toplevel.wl_surface();
-                    popups_of(surface)
+                    popups_of(surface, origin)
                         .find_map(|(popup, loc)| under_from_surface_tree(&popup, location, loc, WindowSurfaceType::ALL))
-                        .or_else(|| under_from_surface_tree(surface, location, (0, 0), WindowSurfaceType::ALL))
+                        .or_else(|| under_from_surface_tree(surface, location, origin, WindowSurfaceType::ALL))
                 })
             })
             .map(|(surface, loc)| (surface, loc.to_f64()))
@@ -416,6 +444,7 @@ pub fn run_winit(
     let (mut backend, mut winit) = winit::init::<GlesRenderer>()?;
     // Before Xwayland and the app start, which only look for it when they connect.
     dmabuf::init(&mut state.dmabuf_state, &dh, backend.renderer());
+    dmabuf::import_pending(&mut state, backend.renderer());
 
     {
         let (renderer, _) = backend.bind().unwrap();
@@ -598,9 +627,10 @@ pub fn run_winit(
                         ));
                     }
                 }
+                let origin = state.content_area().loc;
                 for toplevel in state.xdg_shell_state.toplevel_surfaces() {
                     let surface = toplevel.wl_surface();
-                    for (popup, loc) in popups_of(surface) {
+                    for (popup, loc) in popups_of(surface, origin) {
                         elements.extend(render_elements_from_surface_tree(
                             renderer,
                             &popup,
@@ -613,7 +643,7 @@ pub fn run_winit(
                     elements.extend(render_elements_from_surface_tree(
                         renderer,
                         surface,
-                        (0, 0),
+                        origin.to_physical(1),
                         1.0,
                         1.0,
                         Kind::Unspecified,
@@ -623,13 +653,14 @@ pub fn run_winit(
                 let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180).unwrap();
                 frame.clear(Color32F::new(0.1, 0.0, 0.0, 1.0), &[damage]).unwrap();
                 draw_render_elements(&mut frame, 1.0, &elements, &[damage]).unwrap();
+                draw_timer_bar(&mut frame, size, timer.progress(now))?;
                 // We rely on the nested compositor to do the sync for us
                 let _ = frame.finish().unwrap();
             }
 
             let time = start_time.elapsed().as_millis() as u32;
             for toplevel in state.xdg_shell_state.toplevel_surfaces() {
-                for (popup, _) in popups_of(toplevel.wl_surface()) {
+                for (popup, _) in popups_of(toplevel.wl_surface(), Point::default()) {
                     send_frames_surface_tree(&popup, time);
                 }
                 send_frames_surface_tree(toplevel.wl_surface(), time);
@@ -656,7 +687,10 @@ pub fn run_winit(
 
         // It is important that all events on the display have been dispatched and flushed to clients before
         // swapping buffers because this operation may block.
-        backend.submit(Some(&[damage])).unwrap();
+        // Only present when we actually bound and rendered a frame above.
+        if focused {
+            backend.submit(Some(&[damage])).unwrap();
+        }
     }
 }
 
