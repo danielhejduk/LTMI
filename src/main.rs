@@ -372,6 +372,10 @@ struct Args {
     /// Argument preset to launch the program with
     #[arg(short, long, value_enum, default_value_t)]
     preset: launch::Preset,
+
+    /// Cut the app off from the network
+    #[arg(short, long)]
+    offline: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -383,13 +387,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing_subscriber::fmt().init();
     }
 
-    run_winit(args.app, args.time, args.preset)
+    run_winit(args.app, args.time, args.preset, args.offline)
 }
 
 pub fn run_winit(
     app_name: String,
     duration: Duration,
     preset: launch::Preset,
+    offline: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut display: Display<App> = Display::new()?;
     let dh = display.handle();
@@ -467,14 +472,18 @@ pub fn run_winit(
     let socket_name = listener.socket_name().unwrap().to_owned();
     let socket_name = socket_name.to_str().unwrap();
     let launch_args = launch::get_args(preset);
-    let mut app = launch::launch(&app_name, &launch_args, socket_name, x_display)?;
+    let mut app = launch::launch(&app_name, &launch_args, socket_name, x_display, offline)?;
     let mut launched_at = Instant::now();
 
     let relaunch_args = launch::get_relaunch_args(preset);
     // Keeps an app that dies right after starting from being respawned every frame.
     const MIN_RELAUNCH_INTERVAL: Duration = Duration::from_secs(1);
+    // Vsync is off and nothing else blocks the loop (no buffer swap at all while unfocused),
+    // so each iteration waits on the event loop until this much time has passed since it began.
+    const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
-    let timer = Timer::new(Instant::now(), duration);
+    // Only counts while the window is focused, so time spent in other windows doesn't count as locked-in time.
+    let mut timer = Timer::new(Instant::now(), duration);
     let mut unlocked = false;
     let mut kill_at: Option<Instant> = None;
     let mut focused = true;
@@ -500,7 +509,7 @@ pub fn run_winit(
                     "{app_name} exited with {status} while locked ({} left), relaunching",
                     humantime::format_duration(left)
                 );
-                app = launch::launch(&app_name, &relaunch_args, socket_name, x_display)?;
+                app = launch::launch(&app_name, &relaunch_args, socket_name, x_display, offline)?;
                 launched_at = now;
             }
         }
@@ -514,7 +523,16 @@ pub fn run_winit(
             WinitEvent::Resized { size, .. } => {
                 state.resize_output(size);
             }
-            WinitEvent::Focus(f) => focused = f,
+            WinitEvent::Focus(f) => {
+                focused = f;
+                let now = Instant::now();
+                if f {
+                    timer.resume(now);
+                } else {
+                    timer.pause(now);
+                }
+                tracing::debug!("focus {f}, timer {}", if f { "running" } else { "paused" });
+            }
             WinitEvent::Input(event) => match event {
                 InputEvent::Keyboard { event } => {
                     keyboard.input::<(), _>(
@@ -678,7 +696,9 @@ pub fn run_winit(
                 clients.push(client);
             }
 
-            event_loop.dispatch(Some(Duration::ZERO), &mut state)?;
+            // Wakes early for Xwayland events; otherwise caps the loop at about 60 iterations a second.
+            let timeout = (now + FRAME_INTERVAL).saturating_duration_since(Instant::now());
+            event_loop.dispatch(Some(timeout), &mut state)?;
             display.dispatch_clients(&mut state)?;
             state.popups.cleanup();
             display.flush_clients()?;
