@@ -758,3 +758,57 @@ delegate_data_device!(App);
 delegate_output!(App);
 delegate_xwayland_shell!(App);
 delegate_dmabuf!(App);
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, error::ErrorKind};
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("ltmi").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn cli_defaults() {
+        let args = parse(&["brave"]).unwrap();
+        assert_eq!(args.app, "brave");
+        assert_eq!(args.time, Duration::from_secs(30 * 60));
+        assert!(matches!(args.preset, launch::Preset::Chromium));
+        assert!(!args.offline);
+    }
+    
+    #[test]
+    fn cli_short_flags() {
+        let args = parse(&["-t", "1h30m", "-p", "blank", "-o", "firefox"]).unwrap();
+        assert_eq!(args.app, "firefox");
+        assert_eq!(args.time, Duration::from_secs(90 * 60));
+        assert!(matches!(args.preset, launch::Preset::Blank));
+        assert!(args.offline);
+    }
+
+    #[test]
+    fn cli_long_flags() {
+        let args = parse(&["--time", "45s", "--preset", "chromium", "--offline", "chromium"]).unwrap();
+        assert_eq!(args.app, "chromium");
+        assert_eq!(args.time, Duration::from_secs(45));
+        assert!(matches!(args.preset, launch::Preset::Chromium));
+        assert!(args.offline);
+    }
+
+    #[test]
+    fn cli_requires_an_app() {
+        let err = parse(&[]).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn cli_rejects_a_bad_time() {
+        let err = parse(&["-t", "soon", "brave"]).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+}
