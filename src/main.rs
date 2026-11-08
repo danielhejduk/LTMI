@@ -9,7 +9,6 @@ use clap::Parser;
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
-        egl::display,
         input::{
             AbsolutePositionEvent, Axis, AxisSource, Event, InputEvent, KeyboardKeyEvent, PointerAxisEvent,
             PointerButtonEvent,
