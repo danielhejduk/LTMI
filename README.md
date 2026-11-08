@@ -1,5 +1,7 @@
 # LTMI
 Lock The Monk In
+## Showcase
+![Brave running inside LTMI](docs/brave.png)
 ## Description
 Minimal non-standalone linux wayland compositor that helps you with your productivity. One fullscreen app and a timer.  
 The timer only runs while the LTMI window is focused, so time spent in other windows doesn't count.
