@@ -9,6 +9,7 @@ use clap::Parser;
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
+        egl::display,
         input::{
             AbsolutePositionEvent, Axis, AxisSource, Event, InputEvent, KeyboardKeyEvent, PointerAxisEvent,
             PointerButtonEvent,
@@ -416,6 +417,12 @@ pub fn run_winit(
     // Before Xwayland and the app start, which only look for it when they connect.
     dmabuf::init(&mut state.dmabuf_state, &dh, backend.renderer());
 
+    {
+        let (renderer, _) = backend.bind().unwrap();
+        let display = renderer.egl_context().display().get_display_handle();
+        unsafe { smithay::backend::egl::ffi::egl::SwapInterval(**display, 0) };
+    }
+
     state.resize_output(backend.window_size());
 
     let start_time = std::time::Instant::now();
@@ -442,6 +449,7 @@ pub fn run_winit(
     let timer = Timer::new(Instant::now(), duration);
     let mut unlocked = false;
     let mut kill_at: Option<Instant> = None;
+    let mut focused = true;
 
     loop {
         let now = Instant::now();
@@ -478,6 +486,7 @@ pub fn run_winit(
             WinitEvent::Resized { size, .. } => {
                 state.resize_output(size);
             }
+            WinitEvent::Focus(f) => focused = f,
             WinitEvent::Input(event) => match event {
                 InputEvent::Keyboard { event } => {
                     keyboard.input::<(), _>(
@@ -569,55 +578,54 @@ pub fn run_winit(
             PumpStatus::Exit(_) => return Ok(()),
         };
 
-        // Before binding: importing leaves the EGL context without ltmi's window surface, which bind() restores.
-        dmabuf::import_pending(&mut state, backend.renderer());
-
         let size = backend.window_size();
         let damage = Rectangle::from_size(size);
         {
-            let (renderer, mut framebuffer) = backend.bind().unwrap();
-            // Elements are ordered front to back: X11 windows (newest first) above the Wayland toplevels,
-            // and each toplevel's popups before the toplevel itself.
-            let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
-            for window in state.x11_windows.iter().rev() {
-                if let Some(surface) = window.wl_surface() {
+            if focused {
+                let (renderer, mut framebuffer) = backend.bind().unwrap();
+                // Elements are ordered front to back: X11 windows (newest first) above the Wayland toplevels,
+                // and each toplevel's popups before the toplevel itself.
+                let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+                for window in state.x11_windows.iter().rev() {
+                    if let Some(surface) = window.wl_surface() {
+                        elements.extend(render_elements_from_surface_tree(
+                            renderer,
+                            &surface,
+                            window.geometry().loc.to_physical(1),
+                            1.0,
+                            1.0,
+                            Kind::Unspecified,
+                        ));
+                    }
+                }
+                for toplevel in state.xdg_shell_state.toplevel_surfaces() {
+                    let surface = toplevel.wl_surface();
+                    for (popup, loc) in popups_of(surface) {
+                        elements.extend(render_elements_from_surface_tree(
+                            renderer,
+                            &popup,
+                            loc.to_physical(1),
+                            1.0,
+                            1.0,
+                            Kind::Unspecified,
+                        ));
+                    }
                     elements.extend(render_elements_from_surface_tree(
                         renderer,
-                        &surface,
-                        window.geometry().loc.to_physical(1),
+                        surface,
+                        (0, 0),
                         1.0,
                         1.0,
                         Kind::Unspecified,
                     ));
                 }
-            }
-            for toplevel in state.xdg_shell_state.toplevel_surfaces() {
-                let surface = toplevel.wl_surface();
-                for (popup, loc) in popups_of(surface) {
-                    elements.extend(render_elements_from_surface_tree(
-                        renderer,
-                        &popup,
-                        loc.to_physical(1),
-                        1.0,
-                        1.0,
-                        Kind::Unspecified,
-                    ));
-                }
-                elements.extend(render_elements_from_surface_tree(
-                    renderer,
-                    surface,
-                    (0, 0),
-                    1.0,
-                    1.0,
-                    Kind::Unspecified,
-                ));
-            }
 
-            let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180).unwrap();
-            frame.clear(Color32F::new(0.1, 0.0, 0.0, 1.0), &[damage]).unwrap();
-            draw_render_elements(&mut frame, 1.0, &elements, &[damage]).unwrap();
-            // We rely on the nested compositor to do the sync for us
-            let _ = frame.finish().unwrap();
+                let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180).unwrap();
+                frame.clear(Color32F::new(0.1, 0.0, 0.0, 1.0), &[damage]).unwrap();
+                draw_render_elements(&mut frame, 1.0, &elements, &[damage]).unwrap();
+                // We rely on the nested compositor to do the sync for us
+                let _ = frame.finish().unwrap();
+            }
 
             let time = start_time.elapsed().as_millis() as u32;
             for toplevel in state.xdg_shell_state.toplevel_surfaces() {
