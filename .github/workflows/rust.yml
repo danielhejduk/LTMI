@@ -43,7 +43,7 @@ jobs:
           sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
       - name: Upload to Github release
-        uses: softprogs/action-gh-release@v2
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ env.ARCHIVE }}
