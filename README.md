@@ -10,4 +10,5 @@ No configuration files, only flags.
 `-t`, `--time` - Set the timer: `30m`, `2h`  
 `-p`, `--preset` - Argument preset: `chromium`, `blank`  
 `-o`, `--offline` - Cut the app off from the network  
-
+### Why did I make this?
+I have hard time concetrating on my work so I wanna make a hard way for me to procrastinate.
